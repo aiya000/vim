@@ -203,6 +203,29 @@ static struct vimvar
     {VV_NAME("versionlong",	 VAR_NUMBER), VV_RO},
 };
 
+/*
+ * A type for template literals.
+ * e.g. "${some_literal}", "$var".
+ */
+typedef struct {
+    /*
+     * Does this have a form "${some_literal}" ?
+     * (if this is FALSE, this have a form "$var".)
+     */
+    int is_embedded_literal;
+
+    /*
+     * "some_literal" or "var" or else.
+     */
+    char_u *expr;
+
+    /*
+     * Stringified (evaluated) .expr by Vim script's string().
+     * (NULL if this is never calculated yet.)
+     */
+    char_u *stringified;
+} embedded_T;
+
 /* shorthand */
 #define vv_type		vv_di.di_tv.v_type
 #define vv_nr		vv_di.di_tv.vval.v_number
@@ -244,6 +267,27 @@ static int eval7(char_u **arg, typval_T *rettv, int evaluate, int want_string);
 
 static int get_string_tv(char_u **arg, typval_T *rettv, int evaluate);
 static int get_lit_string_tv(char_u **arg, typval_T *rettv, int evaluate);
+static int get_template_string_tv(char_u *(*enclose)(char_u*), char_u *(*disclose)(char_u*), int (*should_be_escaped)(char_u), char_u *(*fix_quote)(char_u), int (*is_closing_quote)(char_u*), char_u **arg, typval_T *rettv, int evaluate);
+static int is_single_quote(char_u x);
+static int nothing_to_escape(char_u);
+static char_u *disclose_quote(char_u *quoted);
+static int is_started_with_quote(char_u *x);
+static void mb_ptr_adv_nth(char_u **p, size_t n);
+static char_u *read_template_string(int (*is_closing_quote)(char_u*), char_u *source);
+static char_u *enclose_by_single_quote(char_u *content);
+static char_u *enclose_by_double_quote(char_u *content);
+static int is_closing_single_quote(char_u *x);
+static int is_closing_double_quote(char_u *x);
+static char_u *duplicate_single_quote(char_u x);
+static char_u *dont_fix(char_u x);
+static char_u *parse_template(char_u *(*enclose)(char_u*), char_u *(*disclose)(char_u*), int (*should_be_escaped)(char_u), char_u *(*fix_quote)(char_u), int (*is_closing_quote)(char_u*), char_u *template, int evaluate);
+static void escape_quotes(char_u **source, int (*should_be_escaped)(char_u), char_u *(*fix_quote)(char_u));
+static embedded_T **read_embedded(char_u *template, size_t *embedded_size);
+static void stringify(embedded_T *embedded, char_u *(*disclose)(char_u*));
+static embedded_T *read_next_embedded_lit(char_u *whole_embedding, char_u *template);
+static embedded_T *read_next_embedded_var(char_u *whole_embedding, char_u *template);
+static size_t calc_strlen_from_template(char_u *template, embedded_T **embedded, size_t embedded_size);
+static char_u *embed_embedded(int (*is_closing_quote)(char_u*), size_t result_size, char_u *source, embedded_T **embedded, size_t embedded_size);
 static int free_unref_items(int copyID);
 static int get_env_tv(char_u **arg, typval_T *rettv, int evaluate);
 static int get_env_len(char_u **arg);
@@ -4571,6 +4615,41 @@ eval7(
 		break;
 
     /*
+     * Template string constant: $"string ${var}", $'literal string ${var}'
+     * or
+     * Environment variable: $VAR.
+     */
+    case '$':	if ((*arg)[1] == '\'')  // Template literal string
+		{
+		    ret = get_template_string_tv(
+			    enclose_by_single_quote,
+			    disclose_quote,
+			    is_single_quote,
+			    duplicate_single_quote,
+			    is_closing_single_quote,
+			    arg,
+			    rettv,
+			    evaluate);
+		}
+		else if ((*arg)[1] == '"')  // Template string
+		{
+		    ret = get_template_string_tv(
+			    enclose_by_double_quote,
+			    disclose_quote,
+			    nothing_to_escape,
+			    dont_fix,
+			    is_closing_double_quote,
+			    arg,
+			    rettv,
+			    evaluate);
+		}
+		else  // Enviroment variable
+		{
+		    ret = get_env_tv(arg, rettv, evaluate);
+		}
+		break;
+
+    /*
      * List: [expr, expr]
      */
     case '[':	ret = get_list_tv(arg, rettv, evaluate);
@@ -4601,12 +4680,6 @@ eval7(
      * Option value: &name
      */
     case '&':	ret = get_option_tv(arg, rettv, evaluate);
-		break;
-
-    /*
-     * Environment variable: $VAR.
-     */
-    case '$':	ret = get_env_tv(arg, rettv, evaluate);
 		break;
 
     /*
@@ -5405,6 +5478,861 @@ get_lit_string_tv(char_u **arg, typval_T *rettv, int evaluate)
     *arg = p + 1;
 
     return OK;
+}
+
+/*
+ * enclose_by_single_quote("a content") ==# "'a content '"
+ *
+ * This result MUST BE EXECUTED BY free() later!
+ */
+    static char_u*
+enclose_by_single_quote(char_u *content)
+{
+    size_t	content_length = STRLEN(content);
+    size_t	whole_length = content_length + 2;
+
+    char_u *lit_string = (char_u*)alloc_clear(whole_length + 1);
+    lit_string[0] = '\'';
+    memcpy(lit_string + 1, content, content_length);
+    lit_string[whole_length - 1] = '\'';
+
+    return lit_string;
+}
+
+/*
+ * enclose_by_double_quote("a content") ==# "\"a content \""
+ *
+ * This result MUST BE EXECUTED BY free() later!
+ */
+    static char_u*
+enclose_by_double_quote(char_u *content)
+{
+    size_t	content_length = STRLEN(content);
+    size_t	whole_length = content_length + 2;
+
+    char_u *lit_string = (char_u*)alloc_clear(whole_length + 1);
+    lit_string[0] = '"';
+    memcpy(lit_string + 1, content, content_length);
+    lit_string[whole_length - 1] = '"';
+
+    return lit_string;
+}
+
+    static int
+is_started_with_quote(char_u *x)
+{
+    return
+	x[0] == '\'' ||
+	x[0] == '"';
+}
+
+/*
+ * This result MUST BE EXECUTED BY free() later!
+ */
+    static char_u*
+disclose_quote(char_u *quoted)
+{
+    const size_t	QUOTES_LENGTH = 2;  // strlen("''")
+    size_t		result_length = STRLEN(quoted) - QUOTES_LENGTH;
+    char_u		*result;
+
+    if ((quoted[0] != '\'') && (quoted[0] != '"'))
+    {
+	return NULL;
+    }
+    result = (char_u*)alloc_clear(result_length + 1);
+
+    memcpy(result, quoted + 1, result_length);
+    return result;
+}
+
+/*
+ * This result MUST BE EXECUTED BY free() later!
+ */
+    static char_u*
+duplicate_single_quote(char_u x)
+{
+    char_u	*xs;
+
+    if (x == '\'')
+    {
+	return vim_strsave((char_u*) "''");
+    }
+
+    xs = (char_u*)alloc_clear(2);
+    xs[0] = x;
+    return xs;
+}
+
+/*
+ * This result MUST BE EXECUTED BY free() later!
+ */
+    static char_u*
+dont_fix(char_u x)
+{
+    char_u	*xs = (char_u*)alloc_clear(2);
+    xs[0] = x;
+    return xs;
+}
+
+    static int
+is_single_quote(char_u x)
+{
+    return x == '\'';
+}
+
+    static int
+nothing_to_escape(char_u _)
+{
+    return FALSE;
+}
+
+    static int
+is_closing_single_quote(char_u *x)
+{
+    const char_u	DELIMITTERS[] = {NUL, ',', ')', ' '};
+    const size_t	DELIMITTERS_SIZE = 4;
+    size_t		i;
+
+    if (x[0] != '\'')
+    {
+	return FALSE;
+    }
+
+    for (i = 0; i < DELIMITTERS_SIZE; ++i)
+    {
+	if (x[1] == DELIMITTERS[i])
+	{
+	    return TRUE;
+	}
+    }
+
+    return FALSE;
+}
+
+/*
+ * NOTICE: x[-1] must be readable.
+ */
+    static int
+is_closing_double_quote(char_u *x)
+{
+    return (x[0] == '"') && (x[-1] != '\\');
+}
+
+/*
+ * Allocate a variable for a $'string ${var} $x' constant.
+ * Return OK or FAIL.
+ *
+ * enclose() encloses a content by '' (or "").
+ * fix_quote() fixes quotes ' to ''. this fixes a problem that string() stringifies {"x": 10} to {'x': 10}, ["a", "b"] to ['a', 'b'].
+ * is_closing_quote() checks a char is ' (or ").
+ */
+    static int
+get_template_string_tv(
+	char_u		*(*enclose)(char_u*),
+	char_u		*(*disclose)(char_u*),
+	int		(*should_be_escaped)(char_u),
+	char_u		*(*fix_quote)(char_u),
+	int		(*is_closing_quote)(char_u*),
+	char_u		**arg,
+	typval_T	*rettv,
+	int		evaluate)
+{
+    char_u	*string;
+    char_u	*string_tofree;
+    char_u	*template;
+
+    // NOTE: At here, "${}" of "${" "expr" "}", that called 'embedding', and "expr" called 'embedded'.
+
+    template = read_template_string(is_closing_quote, *arg);
+    if (template == NULL)
+    {
+	return FAIL;
+    }
+
+    // Parse a template string into a plain string
+    string = parse_template(enclose, disclose, should_be_escaped, fix_quote, is_closing_quote, template, evaluate);
+    if (string == NULL)
+    {
+	vim_free(template);
+	return FAIL;
+    }
+
+    // Eval the result (non template) string
+    string_tofree = string;
+    eval1(&string, rettv, evaluate);
+    vim_free(string_tofree);
+
+    // Consume
+    *arg += STRLEN(template);
+    vim_free(template);
+
+    return OK;
+}
+
+/*
+ * Get a string between a opening "$'" and a closing "'" (or "$\"" and "\""),
+ * and check a taken string is not missing a closing "'".
+ *
+ * This result MUST BE EXECUTED BY free() later! (if it is not NULL.)
+ */
+    static char_u*
+read_template_string(int (*is_closing_quote)(char_u*), char_u *source)
+{
+    const size_t 	OPENING_QUOTE_LENGTH = 2;  // "$'"
+    char_u		*p;
+    char_u		*template;
+    size_t		template_length;
+
+    for (p = source + OPENING_QUOTE_LENGTH; !(is_closing_quote(p) || *p == NUL); MB_PTR_ADV(p))
+	;
+    if (*p == NUL)
+    {
+	semsg(_("E115: Missing quote: %s"), source);
+	return NULL;
+    }
+
+    template_length = p - source + 1;  // 1 to count by 1-based
+    template = (char_u*)alloc_clear(template_length + 1);
+    memcpy(template, source, template_length);
+    return template;
+}
+
+    static size_t
+sum_embedded_expr_strlen(embedded_T **embedded, size_t embedded_size)
+{
+    size_t	length = 0;
+    size_t	i;
+
+    for (i = 0; i < embedded_size; ++i)
+    {
+	length += STRLEN(embedded[i]->expr);
+    }
+
+    return length;
+}
+
+    static size_t
+sum_embedded_stringified_strlen(embedded_T **embedded, size_t embedded_size)
+{
+    size_t	length = 0;
+    size_t	i;
+
+    for (i = 0; i < embedded_size; ++i)
+    {
+	length += STRLEN(embedded[i]->stringified);
+    }
+
+    return length;
+}
+
+    static size_t
+sum_embedding_strlen(embedded_T **embedded, size_t embedded_size)
+{
+    const size_t	LITERAL_EMBEDDING_LENGTH = 3;  // a number of strlen("${}")
+    const size_t	VAR_EMBEDDING_LENGTH = 1;  // a number of strlen("$")
+    size_t		length = 0;
+    size_t		i;
+
+    for (i = 0; i < embedded_size; ++i)
+    {
+	length += embedded[i]->is_embedded_literal
+		? LITERAL_EMBEDDING_LENGTH
+		: VAR_EMBEDDING_LENGTH;
+    }
+
+    return length;
+}
+
+/*
+ * Count up independent "$"s on template.
+ * (Count up embedding.)
+ */
+     static size_t
+count_embedding(char_u *template)
+{
+    size_t	count = 0;
+    char_u	*p = template + 1;  // skip a head of '$'
+
+    // Allow to refer -1 at later
+    if (p[0] == '$' && p[1] != '$')
+    {
+	++count;
+    }
+    MB_PTR_ADV(p);
+
+    for (; *p != NUL; MB_PTR_ADV(p))
+    {
+	// Is p an independent '$'? e.g. "x$x". not "$$x" nor "x$$".
+	if (p[-1] != '$' && p[0] == '$' && p[1] != '$')
+	{
+	    ++count;
+	    ++p;      // a part of "$"
+	    continue; // a part of "{" (increasing)
+	}
+    }
+
+    return count;
+}
+
+/*
+ * Allocate a `embedded_T*`.
+ */
+    static embedded_T*
+new_embedded(int is_embedded_literal, char_u *expr, size_t expr_size)
+{
+    embedded_T *x = ALLOC_ONE(embedded_T);
+    x->is_embedded_literal = is_embedded_literal;
+
+    x->expr = (char_u*)alloc_clear(expr_size + 1);
+    memcpy(x->expr, expr, expr_size);
+
+    x->stringified = NULL;
+    return x;
+}
+
+/*
+ * Free it and its fields.
+ */
+    static void
+delete_embedded(embedded_T **x)
+{
+    embedded_T *xx = *x;
+
+    vim_free(xx->expr);
+    xx->expr = NULL;
+
+    if (xx->stringified != NULL)
+    {
+	vim_free(xx->stringified);
+	xx->stringified = NULL;
+    }
+
+    vim_free(*x);
+    *x = NULL;
+}
+
+/*
+ * Apply delete_embedded() to all elements.
+ *
+ * embedded: A reference to an array of pointers of elements
+ * embedded_size: The array's size
+ */
+    static void
+delete_embedded_all(embedded_T ***embedded, size_t embedded_size)
+{
+    size_t	i;
+    embedded_T	**xs = *embedded;
+
+    for (i = 0; i < embedded_size; ++i)
+    {
+	delete_embedded(&xs[i]);
+    }
+
+    vim_free(*embedded);
+    *embedded = NULL;
+}
+
+/*
+ * Parse a template string into a (non template) string.
+ *
+ * The result MUST BE EXECUTED BY free() later! (if it is not NULL.)
+ */
+    static char_u*
+parse_template(
+	char_u		*(*enclose)(char_u*),
+	char_u		*(*disclose)(char_u*),
+	int		(*should_be_escaped)(char_u),
+	char_u		*(*fix_quote)(char_u),
+	int		(*is_closing_quote)(char_u*),
+	char_u		*template,
+	int		evaluate)
+{
+    const size_t	QUOTES_LENGTH = 3;  // a number of strlen("$''") (or strlen("$\"\""))
+    const size_t	OPNEING_QUOTE_LENGTH = 2;  // a number of strlen("$'")
+    char_u		*result;
+    size_t		embedded_size;  // a size of embedded
+    embedded_T		**embedded;
+    size_t		i;
+
+    // If the evaluation is not needed,
+    // consume all of the template string,
+    // and return the original template string as a (non literal) string.
+    if (!evaluate)
+    {
+	size_t content_size = STRLEN(template) - QUOTES_LENGTH;
+
+	// Copy without surrounding $''
+	result = (char_u*)alloc_clear(content_size + 1);
+	memcpy(result, template + OPNEING_QUOTE_LENGTH, content_size);
+	return result;
+    }
+
+    embedded = read_embedded(template, &embedded_size);
+    if (embedded_size != 0 && embedded == NULL)
+    {
+	return NULL;
+    }
+
+    // Stringify embedded expressions
+    // and Escape ' to ''.
+    for (i = 0; i < embedded_size; ++i)
+    {
+	stringify(embedded[i], disclose);
+	if (embedded[i]->stringified == NULL)
+	{
+	    delete_embedded_all(&embedded, embedded_size);
+	    return NULL;
+	}
+	escape_quotes(&embedded[i]->stringified, should_be_escaped, fix_quote);
+    }
+
+    // Replace embeddings by actual values into result
+    {
+	// 'content' means a string content withou the head and tail '"' (or '\'')
+	size_t		content_size = calc_strlen_from_template(template, embedded, embedded_size);
+	char_u		*content = embed_embedded(is_closing_quote, content_size, template, embedded, embedded_size);
+	if (content == NULL)
+	{
+	    delete_embedded_all(&embedded, embedded_size);
+	    return NULL;
+	}
+
+	result = enclose(content);
+	vim_free(content);
+    }
+
+    delete_embedded_all(&embedded, embedded_size);
+    return result;
+}
+
+    size_t
+count_quotes(char_u *str, int (*should_be_escaped)(char_u))
+{
+    size_t	count = 0;
+    char_u	*p;
+
+    for (p = str; *p != NUL; MB_PTR_ADV(p))
+    {
+	if (should_be_escaped(*p))
+	{
+	    ++count;
+	}
+    }
+
+    return count;
+}
+
+/*
+ * Replace ' to ''.
+ * this fixes a string() problem that doesn't save string({"x": 10})'s ".
+ * (It is stringified to {'x': 10}.)
+ */
+    static void
+escape_quotes(char_u **source, int (*should_be_escaped)(char_u), char_u *(*fix_quote)(char_u))
+{
+    char_u	*source_tofree = *source;
+    char_u	*to_source = *source;
+    char_u	*to_dest;
+    size_t	quotes_count = count_quotes(*source, should_be_escaped);
+
+    *source = (char_u*)alloc_clear(STRLEN(*source) + quotes_count + 1);
+    to_dest = *source;
+
+    for (; *to_source != NUL; MB_PTR_ADV(to_dest), MB_PTR_ADV(to_source))
+    {
+	char_u		*fixed = fix_quote(*to_source);
+	size_t		fixed_size = STRLEN(fixed);
+
+	memcpy(to_dest, fixed, fixed_size);
+	vim_free(fixed);
+	mb_ptr_adv_nth(&to_dest, fixed_size - 1);  // 1 increased by next for's effect
+    }
+
+    vim_free(source_tofree);
+    *source = *source;
+}
+
+    static int
+is_template_string_escape(char_u *p)
+{
+    return (p[0] == '$' && p[1] == '$');
+}
+
+/*
+ * Recognize escaping and
+ * Count up a template string length.
+ */
+    static size_t
+strlen_template(char_u *template)
+{
+    size_t	escaped = 0;
+    char_u	*p;
+
+    for (p = template; *p != NUL; MB_PTR_ADV(p))
+    {
+	if (is_template_string_escape(p))
+	{
+	    ++escaped;
+	    MB_PTR_ADV(p);
+	}
+    }
+
+    return p - template - escaped;
+}
+
+/*
+ * Calc a length of a string that is made by embed_embedded()
+ */
+    static size_t
+calc_strlen_from_template(char_u *template, embedded_T **embedded, size_t embedded_size)
+{
+    const size_t	QUOTES_LENGTH = 3;  // a number of strlen("$''"), (or strlen("$\"\""))
+    size_t		all_embedded_size = sum_embedded_expr_strlen(embedded, embedded_size);
+    size_t		all_embedding_size = sum_embedding_strlen(embedded, embedded_size);
+    size_t		all_stringified_size = sum_embedded_stringified_strlen(embedded, embedded_size);
+    size_t		template_length = strlen_template(template);
+
+    // NOTE: e.g.
+    //  |-- 10 --|       |----  16 -----|    |3|      |2|     |3|           |2|
+    // "aaa 10 bbb"  =  "$'aaa ${10} bbb' - "$''" - ("10" + ("${}" * 1)) + "10"
+    //
+    //  |--- 10 --|      |------ 19 -------|     |3|       |2|    |3|       |3|     |3|        |2|    |3|
+    // "hi 10, 200"  =  "$'hi ${10}, ${200}'" - "$''" - (("10" + "${}") + ("200" + "${}")) + ("10" + "200")
+    //
+    //  |--- 10 --|      |----- 16 -----|     |3|      |1|   |1|      |3|     |3|        |2|    |3|
+    // "hi 10, 200"  =  "$'hi $x, ${200}'" - "$''" - (("x" + "$") + ("200" + "${}")) + ("10" + "200")
+    // (if x = 10)
+    //
+    //
+    //  |-  8 -|       |---  14  ---|     |3|      |2|     |3|           |2|
+    // `10 \\ \"`  =  `$"${10} \\ \""` - `$""` - `(10` + (`${}` * 1)) + `10`
+    //
+    // and
+    //
+    //  |3|       |--- 11 --|     |3|      | 5 |      |3|           |3|
+    // `vim`  =  `$'${"vim"}'` - `$''` - (`"vim"` + (`${}` * 1)) + `vim`
+
+    return template_length - QUOTES_LENGTH - (all_embedded_size + all_embedding_size) + all_stringified_size;
+}
+
+/*
+ * Apply MB_PTR_ADV() n-th
+ */
+    static void
+mb_ptr_adv_nth(char_u **p, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; ++i)
+    {
+	MB_PTR_ADV(*p);
+    }
+}
+
+/*
+ * Is p in base ~ (base + range) ?
+ */
+    static int
+is_in_range(char_u *p, char_u *base, size_t range)
+{
+    return base <= p && p <= (base + range);
+}
+
+    static int
+is_on_last(char_u *p, char_u *base, size_t range)
+{
+    return p == (base + range);
+}
+
+/*
+ * Replace all "${...}" of source by each actual values.
+ * source is a template string.
+ * By `read_embedded()` or else, source must be checked that have no unterminated embedding.
+ */
+    static char_u*
+embed_embedded(
+	int		(*is_closing_quote)(char_u*),
+	size_t		result_size,
+	char_u		*source,
+	embedded_T	**embedded,
+	size_t		embedded_size)
+{
+    const size_t	LITERAL_EMBEDDING_START_LENGTH = 2;  // a number of "${"
+    const size_t	VAR_EMBEDDING_START_LENGTH = 1;  // a number of head "$"
+    char_u		*result = (char_u*)alloc_clear(result_size + 1);
+    char_u		*to_result = result;
+    char_u		*to_source = source + 2;  // Skip the first "$'"
+    size_t		finished = 0;  // a count of finished embedding
+
+    for (;
+	!(is_closing_quote(to_source) || *to_source == NUL) && is_in_range(to_result, result, result_size);
+	MB_PTR_ADV(to_source), MB_PTR_ADV(to_result))
+    {
+	if (to_source[0] == '$' && to_source[1] == '$')  // escaped '$'
+	{
+	    *to_result = '$';
+	    MB_PTR_ADV(to_source);
+	    continue;
+	}
+	else if (to_source[0] == '$')  // Do embed to $var
+	{
+	    size_t embedding_start_length = embedded[finished]->is_embedded_literal
+		? LITERAL_EMBEDDING_START_LENGTH
+		: VAR_EMBEDDING_START_LENGTH;
+	    size_t embedding_close_length = embedded[finished]->is_embedded_literal
+		? 1
+		: 0;
+	    size_t embedding_length =
+		embedding_start_length +
+		STRLEN(embedded[finished]->expr) +
+		embedding_close_length;
+
+	    memcpy(to_result, embedded[finished]->stringified, STRLEN(embedded[finished]->stringified));
+	    mb_ptr_adv_nth(&to_source, embedding_length - 1);  // 1 is increased by for's effect later!
+	    mb_ptr_adv_nth(&to_result, STRLEN(embedded[finished]->stringified) - 1);  // same
+	    ++finished;
+	    continue;
+	}
+	else if (MB_PTR2LEN(to_source) > 1)
+	{
+	    mch_memmove(to_result, to_source, (size_t) (*mb_ptr2len)(to_source));
+	    continue;
+	}
+	*to_result = *to_source;
+    }
+
+    if (!is_on_last(to_result, result, result_size))
+    {
+	semsg(
+		_("Internal Error! %p is not on between %p and %p: result = \"%s\", to_result = \"%s\", result_size = %d"),
+		to_result,
+		result,
+		result + result_size,
+		result,
+		to_result,
+		result_size
+		);
+	return NULL;
+    }
+
+    return result;
+}
+
+/*
+ * Apply a non string expression by string() in Vim script into ->stringified.
+ *
+ * This ->stringified MUST BE EXECUTED BY free() later! (if it is not NULL.)
+ */
+    static void
+stringify(embedded_T *embedded, char_u *(*disclose)(char_u*))
+{
+    typval_T	applied = {VAR_STRING, VAR_LOCKED, {0}};
+    char_u	*applying;
+    char_u	*applying_tofree;  // to free
+
+    // string constants returns without string()
+    if (is_started_with_quote(embedded->expr))
+    {
+	char_u *already_stringified = disclose(embedded->expr);
+	embedded->stringified = already_stringified;
+	return;
+    }
+
+    // Apply string()
+    applying = alloc(STRLEN(embedded->expr) + STRLEN("string()") + 1);
+    applying_tofree = applying;
+
+    sprintf((char*) applying, "string(%s)", embedded->expr);
+    eval1(&applying, &applied, TRUE);
+    vim_free(applying_tofree);
+
+    if (applied.v_type == VAR_UNKNOWN)
+    {
+	// Maybe, this VAR_UNKNOWN is occured only by 'Undefined variable'
+	semsg(_("E121: Undefined variable: %s"), embedded->expr);
+	embedded->stringified = NULL;
+	return;
+    }
+
+    // Assign this result
+    embedded->stringified = applied.vval.v_string;
+}
+
+/*
+ * Read all embedded from template,
+ * and check a passed template string is terminated.
+ *
+ * Return got an array of all embedded.
+ *
+ * This result MUST BE EXECUTED BY free() later! (if it is not NUL.)
+ */
+    static embedded_T**
+read_embedded(char_u *template, size_t *embedded_size)
+{
+    embedded_T		**embedded;
+    size_t		finished = 0;
+    char_u		*p;
+
+    *embedded_size = count_embedding(template);
+    embedded = (*embedded_size == 0)
+	? NULL  // Ignore the null allocation
+	: (embedded_T**) alloc(sizeof(embedded_T*) * *embedded_size);
+
+    for (p = template + 2; *p != NUL; MB_PTR_ADV(p))  // skip "$'"
+    {
+	if ((p[-1] == '$' && p[0] == '$') || (p[0] == '$' && p[1] == '$'))  // '$$' escapes to '$'
+	{
+	    continue;
+	}
+	else if (p[0] == '$')
+	{
+	    const size_t	LIT_EMBEDDING_LENGTH = 3;  // a number of "${}"
+	    const size_t	VAR_EMBEDDING_LENGTH = 1;  // a number of "$"
+	    size_t		embedded_length;
+	    size_t		embedded_is_literal = (p[1] == '{');
+	    size_t		embedding_length = embedded_is_literal
+		? LIT_EMBEDDING_LENGTH
+		: VAR_EMBEDDING_LENGTH;
+
+	    embedded[finished] = embedded_is_literal
+		? read_next_embedded_lit(p, template)
+		: read_next_embedded_var(p, template);
+	    if (embedded[finished] == NULL)
+	    {
+		vim_free(embedded);
+		return NULL;
+	    }
+
+	    embedded_length = embedding_length + STRLEN(embedded[finished]->expr);
+	    mb_ptr_adv_nth(&p, embedded_length - 1);  // -1 is increased by next for's effect
+
+	    ++finished;
+	    continue;
+	}
+    }
+
+    return embedded;
+}
+
+    static int
+read_next_string_length(char_u *whole_string, int expect_literal_string, char_u *template)
+{
+    char_u	*p;
+    int		(*is_closing_quote)(char_u*);
+
+    // If entered with the closing quote of a template string into this function
+    if (whole_string[1] == NUL)
+    {
+	semsg(_("E1000: Unterminated template literal: %s"), template);
+	return -1;
+    }
+
+    p = whole_string + 1;  // Skip the head of '"' (or '\'')
+    is_closing_quote = expect_literal_string
+	? is_closing_single_quote
+	: is_closing_double_quote;
+
+    for (; !is_closing_quote(p); MB_PTR_ADV(p))
+    {
+	if (*p == NUL)
+	{
+	    semsg(_("E115: Missing quote: %s"), template);
+	    return -1;
+	}
+    }
+
+    return p - whole_string;
+}
+
+/*
+ * Get a first "expr" of "${" "expr" "}" from whole_embedding.
+ *
+ * whole_embedding starts with "${": e.g. "${10}'", "${var} Hello :D'".
+ *
+ * The result MUST BE EXECUTED BY free() later! (if it is not NULL.)
+ */
+    static embedded_T*
+read_next_embedded_lit(char_u *whole_embedding, char_u *template)
+{
+    const size_t	LITERAL_EMBEDDING_START_LENGTH = 2;  // "${"
+    char_u		*embedded_start = whole_embedding + LITERAL_EMBEDDING_START_LENGTH;
+    size_t		expr_length = 0;  // "${" expr_length "}"
+    size_t		nested_blocks = 0;  // {}'s nests: ${{'x': 10}}, ${something({})}
+    char_u		*p;
+
+    if (*embedded_start == '}')
+    {
+	semsg(_("E1000: Empty template literal: %s"), template);
+	return NULL;
+    }
+
+    for (p = embedded_start; !(nested_blocks == 0 && *p == '}'); MB_PTR_ADV(p))
+    {
+	switch (*p)
+	{
+	    case '{':
+		++nested_blocks;
+		break;
+	    case '}':
+		--nested_blocks;
+		break;
+	    case '"':
+	    case '\'':
+	    {
+		int length = read_next_string_length(p, (*p == '\''), template);
+		if (length == -1)
+		{
+		    return NULL;
+		}
+		expr_length += length;
+		mb_ptr_adv_nth(&p, length);
+		break;
+	    }
+	    case NUL:
+		semsg(_("E1000: Unterminated template literal: %s"), template);
+		return NULL;  // failed! a closing "}" couldn't be found.
+	}
+	++expr_length;
+    }
+
+    return new_embedded(TRUE, embedded_start, expr_length);
+}
+
+/*
+ * Get a first "var" of "$" "var" from whole_embedding.
+ *
+ * whole_embedding starts with "$": e.g. "$var and me'", "$v_i_m with you".
+ * (like "$x[0]" and "$x.y" only parses the part of "$x".)
+ *
+ * The result MUST BE EXECUTED BY free() later! (if it is not NULL.)
+ */
+    static embedded_T*
+read_next_embedded_var(char_u *whole_embedding, char_u *template)
+{
+    const size_t	NUM_LAST_NON_SNEAK_CHAR = 1;
+    char_u		*expr_start = whole_embedding + 1;  // skip a head '$'
+    char_u		*p;
+
+    if (!ASCII_ISALPHA(expr_start[0]) && (expr_start[0] != '_'))
+    {
+	semsg(_("E1000: Missing variable name on a $: %s"), template);
+	return NULL;
+    }
+
+    for (p = expr_start + 1; *p != NUL; MB_PTR_ADV(p))
+    {
+	if (!ASCII_ISALNUM(*p) && (*p != '_'))
+	{
+	    break;
+	}
+    }
+    if (*p == NUL)
+    {
+	semsg(_("E1000: Unterminated template literal: %s"), template);
+	return NULL;
+    }
+
+    return new_embedded(FALSE, expr_start, (p - NUM_LAST_NON_SNEAK_CHAR) - whole_embedding);
 }
 
 /*
