@@ -341,6 +341,10 @@ syn match	vimSubstTwoBS   contained	"\\\\"
 syn match	vimSubstFlagErr contained	"[^< \t\r|]\+" contains=vimSubstFlags
 syn match	vimSubstFlags   contained	"[&cegiIpr]\+"
 
+" $'Template string' $"${expr}": {{{2
+syn match	vimString	"$'\(''\|\${.\+}\|[^']\)\+'"
+syn match	vimString	"$\"\(\\.\|\${.\+}\|[^\"]\)\+\""
+
 " 'String': {{{2
 syn match	vimString	"[^(,]'[^']\{-}\zs'"
 
